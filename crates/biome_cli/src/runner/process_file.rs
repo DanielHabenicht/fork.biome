@@ -7,7 +7,7 @@ use biome_console::{Console, ConsoleExt};
 use biome_diagnostics::{
     DiagnosticExt, DiagnosticTags, Error, PrintDiagnostic, Severity, category,
 };
-use biome_fs::{BiomePath, File, OpenOptions};
+use biome_fs::{BiomePath, File, FileSystem, OpenOptions};
 use biome_languages::DocumentFileSource;
 use biome_service::diagnostics::FileTooLarge;
 use biome_service::projects::ProjectKey;
@@ -262,7 +262,10 @@ impl ProcessFile for () {
 /// Holds the scanned workspace document and the filesystem handle for a processed file.
 pub(crate) struct WorkspaceFile<'ctx, 'app> {
     guard: FileGuard<'app, dyn Workspace + 'ctx>,
-    file: Box<dyn File>,
+    fs: &'ctx dyn FileSystem,
+    /// Read-only until the first write replaces it with a write handle.
+    file: Option<Box<dyn File>>,
+    writable: bool,
     pub(crate) path: BiomePath,
 }
 
@@ -272,13 +275,12 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
     where
         Ctx: CrawlerContext,
     {
-        let open_options = OpenOptions::default()
-            .read(true)
-            .write(ctx.execution().requires_write_access());
-
+        // Write access is requested only when content changes (see `write_to_disk`):
+        // opening every file for writing copies it up on overlay filesystems and
+        // fails on read-only files that need no change.
         let mut file = ctx
             .fs()
-            .open_with_options(path.as_path(), open_options)
+            .open_with_options(path.as_path(), OpenOptions::default().read(true))
             .with_file_path(path.to_string())?;
 
         if ctx.workspace().file_exists(FileExistsParams {
@@ -286,7 +288,13 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
         })? {
             let guard = FileGuard::borrowed(ctx.workspace(), ctx.project_key(), path.clone())
                 .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?;
-            Ok(Self { guard, path, file })
+            Ok(Self {
+                guard,
+                fs: ctx.fs(),
+                file: Some(file),
+                writable: false,
+                path,
+            })
         } else {
             let guard = FileGuard::new(ctx.workspace(), ctx.project_key(), path.clone())
                 .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?;
@@ -302,7 +310,13 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
                 inline_config: None,
                 editor_features: None,
             })?;
-            Ok(Self { guard, path, file })
+            Ok(Self {
+                guard,
+                fs: ctx.fs(),
+                file: Some(file),
+                writable: false,
+                path,
+            })
         }
     }
 
@@ -315,13 +329,26 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
     }
 
     pub(crate) fn write_to_disk(&mut self, content: String) -> Result<ChangedFile, Error> {
-        self.file
-            .set_content(content.as_bytes())
+        let file = match self.file.take() {
+            Some(file) if self.writable => self.file.insert(file),
+            read_handle => {
+                // Release the read handle first: the in-memory file system holds a
+                // lock for as long as a handle is open.
+                drop(read_handle);
+                let file = self
+                    .fs
+                    .open_with_options(self.path.as_path(), OpenOptions::default().write(true))
+                    .with_file_path(self.path.to_string())?;
+                self.writable = true;
+                self.file.insert(file)
+            }
+        };
+        file.set_content(content.as_bytes())
             .with_file_path(self.path.to_string())?;
         Ok(ChangedFile {
             path: self.path.clone(),
             content,
-            version: self.file.file_version(),
+            version: file.file_version(),
         })
     }
 }
@@ -563,6 +590,8 @@ mod tests {
         assert_eq!(changed.content.as_str(), UPDATED);
         assert_eq!(changed.version, 1);
         assert_eq!(workspace_file.input().unwrap(), SOURCE);
+        let changed = workspace_file.write_to_disk(UPDATED.into()).unwrap();
+        assert_eq!(changed.version, 2);
         drop(workspace_file);
 
         let mut disk_content = String::new();
@@ -571,6 +600,43 @@ mod tests {
             .read_to_string(&mut disk_content)
             .unwrap();
         assert_eq!(disk_content, UPDATED);
+    }
+
+    #[test]
+    fn workspace_file_requests_write_access_only_when_writing() {
+        const SOURCE: &str = "const value = 1;";
+
+        let file_path = Utf8PathBuf::from("/project/file.js");
+        let fs = Arc::new(MemoryFileSystem::new_read_only());
+        fs.insert(file_path.clone(), SOURCE);
+
+        let workspace = server(fs.clone(), None);
+        let OpenProjectResult { project_key } = workspace
+            .open_project(OpenProjectParams {
+                path: BiomePath::new("/project"),
+                open_uninitialized: true,
+            })
+            .unwrap();
+        let path = BiomePath::new(&file_path);
+
+        let (interner, _path_receiver) = PathInterner::new();
+        let ctx = TestContext {
+            fs: fs.clone(),
+            workspace: workspace.as_ref(),
+            project_key,
+            execution: TestExecution { write: true },
+            interner,
+            evaluated_paths: HashSet::default(),
+            file_features: HashMap::default(),
+        };
+
+        let mut workspace_file = WorkspaceFile::new(&ctx, path.clone()).unwrap();
+        assert_eq!(workspace_file.input().unwrap(), SOURCE);
+        assert!(
+            workspace_file
+                .write_to_disk("const value = 2;".into())
+                .is_err()
+        );
     }
 
     #[test]

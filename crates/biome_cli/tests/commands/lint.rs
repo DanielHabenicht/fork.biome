@@ -935,7 +935,7 @@ fn fs_error_read_only() {
     let mut console = BufferConsole::default();
 
     let file_path = Utf8Path::new("test.js");
-    fs.insert(file_path.into(), *b"content");
+    fs.insert(file_path.into(), FIX_BEFORE.as_bytes());
 
     let (fs, result) = run_cli(
         fs,
@@ -951,6 +951,33 @@ fn fs_error_read_only() {
     assert_cli_snapshot(SnapshotPayload::new(
         module_path!(),
         "fs_error_read_only",
+        fs,
+        console,
+        result,
+    ));
+}
+
+#[test]
+fn read_only_file_without_fixes() {
+    let fs = MemoryFileSystem::new_read_only();
+    let mut console = BufferConsole::default();
+
+    let file_path = Utf8Path::new("test.js");
+    fs.insert(file_path.into(), FIX_AFTER.as_bytes());
+
+    let (fs, result) = run_cli(
+        fs,
+        &mut console,
+        Args::from(["lint", "--write", file_path.as_str()].as_slice()),
+    );
+
+    assert!(result.is_ok(), "run_cli returned {result:?}");
+
+    assert_file_contents(&fs, file_path, FIX_AFTER);
+
+    assert_cli_snapshot(SnapshotPayload::new(
+        module_path!(),
+        "read_only_file_without_fixes",
         fs,
         console,
         result,
