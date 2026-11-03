@@ -17,6 +17,7 @@ use biome_service::workspace::{
     SupportKind, SupportsFeatureParams,
 };
 use biome_service::{Workspace, WorkspaceError};
+use std::io;
 
 #[derive(Debug)]
 pub(crate) struct ChangedFile {
@@ -263,9 +264,8 @@ impl ProcessFile for () {
 pub(crate) struct WorkspaceFile<'ctx, 'app> {
     guard: FileGuard<'app, dyn Workspace + 'ctx>,
     fs: &'ctx dyn FileSystem,
-    /// Read-only until the first write replaces it with a write handle.
-    file: Option<Box<dyn File>>,
-    writable: bool,
+    /// Opened on the first write.
+    writer: Option<Box<dyn File>>,
     pub(crate) path: BiomePath,
 }
 
@@ -275,26 +275,17 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
     where
         Ctx: CrawlerContext,
     {
-        // Write access is requested only when content changes (see `write_to_disk`):
-        // opening every file for writing copies it up on overlay filesystems and
-        // fails on read-only files that need no change.
+        // Read-only: write access copies files up on overlay filesystems and fails on read-only files.
         let mut file = ctx
             .fs()
             .open_with_options(path.as_path(), OpenOptions::default().read(true))
             .with_file_path(path.to_string())?;
 
-        if ctx.workspace().file_exists(FileExistsParams {
+        let guard = if ctx.workspace().file_exists(FileExistsParams {
             file_path: path.clone(),
         })? {
-            let guard = FileGuard::borrowed(ctx.workspace(), ctx.project_key(), path.clone())
-                .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?;
-            Ok(Self {
-                guard,
-                fs: ctx.fs(),
-                file: Some(file),
-                writable: false,
-                path,
-            })
+            FileGuard::borrowed(ctx.workspace(), ctx.project_key(), path.clone())
+                .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?
         } else {
             let guard = FileGuard::new(ctx.workspace(), ctx.project_key(), path.clone())
                 .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?;
@@ -310,14 +301,15 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
                 inline_config: None,
                 editor_features: None,
             })?;
-            Ok(Self {
-                guard,
-                fs: ctx.fs(),
-                file: Some(file),
-                writable: false,
-                path,
-            })
-        }
+            guard
+        };
+
+        Ok(Self {
+            guard,
+            fs: ctx.fs(),
+            writer: None,
+            path,
+        })
     }
 
     pub(crate) fn guard(&self) -> &FileGuard<'app, dyn Workspace + 'ctx> {
@@ -329,27 +321,42 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
     }
 
     pub(crate) fn write_to_disk(&mut self, content: String) -> Result<ChangedFile, Error> {
-        let file = match self.file.take() {
-            Some(file) if self.writable => self.file.insert(file),
-            read_handle => {
-                // Release the read handle first: the in-memory file system holds a
-                // lock for as long as a handle is open.
-                drop(read_handle);
-                let file = self
-                    .fs
-                    .open_with_options(self.path.as_path(), OpenOptions::default().write(true))
-                    .with_file_path(self.path.to_string())?;
-                self.writable = true;
-                self.file.insert(file)
-            }
+        let writer = match self.writer.take() {
+            Some(writer) => writer,
+            None => self.open_unchanged_for_writing()?,
         };
-        file.set_content(content.as_bytes())
+        let writer = self.writer.insert(writer);
+        writer
+            .set_content(content.as_bytes())
             .with_file_path(self.path.to_string())?;
         Ok(ChangedFile {
             path: self.path.clone(),
             content,
-            version: file.file_version(),
+            version: writer.file_version(),
         })
+    }
+
+    /// Opens the file for writing, refusing if it no longer holds the content Biome
+    /// processed, so an edit saved meanwhile is not overwritten. Writing through the
+    /// handle that was checked keeps a later rename-over save intact too.
+    fn open_unchanged_for_writing(&self) -> Result<Box<dyn File>, Error> {
+        let mut file = self
+            .fs
+            .open_with_options(
+                self.path.as_path(),
+                OpenOptions::default().read(true).write(true),
+            )
+            .with_file_path(self.path.to_string())?;
+        let mut on_disk = String::new();
+        file.read_to_string(&mut on_disk)
+            .with_file_path(self.path.to_string())?;
+        if on_disk != self.input()? {
+            return Err(io::Error::other(
+                "the file changed on disk while Biome was processing it",
+            ))
+            .with_file_path(self.path.to_string());
+        }
+        Ok(file)
     }
 }
 
@@ -603,11 +610,12 @@ mod tests {
     }
 
     #[test]
-    fn workspace_file_requests_write_access_only_when_writing() {
+    fn workspace_file_does_not_overwrite_a_file_changed_on_disk() {
         const SOURCE: &str = "const value = 1;";
+        const EDITED: &str = "const value = 3;";
 
         let file_path = Utf8PathBuf::from("/project/file.js");
-        let fs = Arc::new(MemoryFileSystem::new_read_only());
+        let fs = Arc::new(MemoryFileSystem::default());
         fs.insert(file_path.clone(), SOURCE);
 
         let workspace = server(fs.clone(), None);
@@ -630,13 +638,22 @@ mod tests {
             file_features: HashMap::default(),
         };
 
-        let mut workspace_file = WorkspaceFile::new(&ctx, path.clone()).unwrap();
-        assert_eq!(workspace_file.input().unwrap(), SOURCE);
+        let mut workspace_file = WorkspaceFile::new(&ctx, path).unwrap();
+        fs.insert(file_path.clone(), EDITED);
+
         assert!(
             workspace_file
                 .write_to_disk("const value = 2;".into())
                 .is_err()
         );
+        drop(workspace_file);
+
+        let mut disk_content = String::new();
+        fs.open(&file_path)
+            .unwrap()
+            .read_to_string(&mut disk_content)
+            .unwrap();
+        assert_eq!(disk_content, EDITED);
     }
 
     #[test]
