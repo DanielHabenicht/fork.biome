@@ -847,6 +847,7 @@ define_categories! {
     "transformations/stripTypes",
 
     // General categories
+    "files/changedOnDisk",
     "files/missingHandler",
     "format",
     "check",

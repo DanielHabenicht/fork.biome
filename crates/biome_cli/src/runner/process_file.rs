@@ -1,7 +1,9 @@
 use crate::CliDiagnostic;
 use crate::cli_options::CliOptions;
 use crate::runner::crawler::CrawlerContext;
-use crate::runner::diagnostics::{ResultExt, ResultIoExt, UnhandledDiagnostic};
+use crate::runner::diagnostics::{
+    ChangedOnDiskDiagnostic, ResultExt, ResultIoExt, UnhandledDiagnostic,
+};
 use crate::runner::execution::Execution;
 use biome_console::{Console, ConsoleExt};
 use biome_diagnostics::{
@@ -17,7 +19,6 @@ use biome_service::workspace::{
     SupportKind, SupportsFeatureParams,
 };
 use biome_service::{Workspace, WorkspaceError};
-use std::io;
 
 #[derive(Debug)]
 pub(crate) struct ChangedFile {
@@ -264,6 +265,8 @@ impl ProcessFile for () {
 pub(crate) struct WorkspaceFile<'ctx, 'app> {
     guard: FileGuard<'app, dyn Workspace + 'ctx>,
     fs: &'ctx dyn FileSystem,
+    /// The content the output is computed from, kept when the execution may write.
+    processed: Option<String>,
     /// Opened on the first write.
     writer: Option<Box<dyn File>>,
     pub(crate) path: BiomePath,
@@ -281,17 +284,25 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
             .open_with_options(path.as_path(), OpenOptions::default().read(true))
             .with_file_path(path.to_string())?;
 
-        let guard = if ctx.workspace().file_exists(FileExistsParams {
+        let write_access = ctx.execution().requires_write_access();
+        let (guard, processed) = if ctx.workspace().file_exists(FileExistsParams {
             file_path: path.clone(),
         })? {
-            FileGuard::borrowed(ctx.workspace(), ctx.project_key(), path.clone())
-                .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?
+            let guard = FileGuard::borrowed(ctx.workspace(), ctx.project_key(), path.clone())
+                .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?;
+            let processed = if write_access {
+                Some(guard.get_file_content()?)
+            } else {
+                None
+            };
+            (guard, processed)
         } else {
             let guard = FileGuard::new(ctx.workspace(), ctx.project_key(), path.clone())
                 .with_file_path_and_code(path.to_string(), category!("internalError/fs"))?;
             let mut input = String::new();
             file.read_to_string(&mut input)
                 .with_file_path(path.to_string())?;
+            let processed = write_access.then(|| input.clone());
             ctx.workspace().open_file(OpenFileParams {
                 project_key: ctx.project_key(),
                 document_file_source: None,
@@ -301,12 +312,13 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
                 inline_config: None,
                 editor_features: None,
             })?;
-            guard
+            (guard, processed)
         };
 
         Ok(Self {
             guard,
             fs: ctx.fs(),
+            processed,
             writer: None,
             path,
         })
@@ -323,7 +335,7 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
     pub(crate) fn write_to_disk(&mut self, content: String) -> Result<ChangedFile, Error> {
         let writer = match self.writer.take() {
             Some(writer) => writer,
-            None => self.open_unchanged_for_writing()?,
+            None => self.open_unchanged_for_writing(&content)?,
         };
         let writer = self.writer.insert(writer);
         writer
@@ -338,8 +350,9 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
 
     /// Opens the file for writing, refusing if it no longer holds the content Biome
     /// processed, so an edit saved meanwhile is not overwritten. Writing through the
-    /// handle that was checked keeps a later rename-over save intact too.
-    fn open_unchanged_for_writing(&self) -> Result<Box<dyn File>, Error> {
+    /// handle that was checked keeps a later rename-over save intact too. A file that
+    /// already holds `content` is accepted: it was written through another path to it.
+    fn open_unchanged_for_writing(&self, content: &str) -> Result<Box<dyn File>, Error> {
         let mut file = self
             .fs
             .open_with_options(
@@ -350,11 +363,12 @@ impl<'ctx, 'app> WorkspaceFile<'ctx, 'app> {
         let mut on_disk = String::new();
         file.read_to_string(&mut on_disk)
             .with_file_path(self.path.to_string())?;
-        if on_disk != self.input()? {
-            return Err(io::Error::other(
-                "the file changed on disk while Biome was processing it",
-            ))
-            .with_file_path(self.path.to_string());
+        let processed = match &self.processed {
+            Some(processed) => processed.clone(),
+            None => self.input()?,
+        };
+        if on_disk != processed && on_disk != content {
+            return Err(ChangedOnDiskDiagnostic.with_file_path(self.path.to_string()));
         }
         Ok(file)
     }
@@ -374,8 +388,9 @@ mod tests {
     use biome_service::Workspace;
     use biome_service::projects::ProjectKey;
     use biome_service::workspace::{
-        FeatureName, FeaturesBuilder, FeaturesSupported, FileContent, GetFileContentParams,
-        OpenFileParams, OpenProjectParams, OpenProjectResult, SupportKind, server,
+        ChangeFileParams, FeatureName, FeaturesBuilder, FeaturesSupported, FileContent,
+        GetFileContentParams, OpenFileParams, OpenProjectParams, OpenProjectResult, SupportKind,
+        server,
     };
     use camino::Utf8PathBuf;
     use papaya::{HashMap, HashSet, HashSetRef, LocalGuard};
@@ -640,6 +655,119 @@ mod tests {
 
         let mut workspace_file = WorkspaceFile::new(&ctx, path).unwrap();
         fs.insert(file_path.clone(), EDITED);
+
+        assert!(
+            workspace_file
+                .write_to_disk("const value = 2;".into())
+                .is_err()
+        );
+        drop(workspace_file);
+
+        let mut disk_content = String::new();
+        fs.open(&file_path)
+            .unwrap()
+            .read_to_string(&mut disk_content)
+            .unwrap();
+        assert_eq!(disk_content, EDITED);
+    }
+
+    #[test]
+    fn workspace_file_accepts_a_file_that_already_holds_the_output() {
+        const SOURCE: &str = "const value = 1;";
+        const OUTPUT: &str = "const value = 2;";
+
+        let file_path = Utf8PathBuf::from("/project/file.js");
+        let fs = Arc::new(MemoryFileSystem::default());
+        fs.insert(file_path.clone(), SOURCE);
+
+        let workspace = server(fs.clone(), None);
+        let OpenProjectResult { project_key } = workspace
+            .open_project(OpenProjectParams {
+                path: BiomePath::new("/project"),
+                open_uninitialized: true,
+            })
+            .unwrap();
+        let path = BiomePath::new(&file_path);
+
+        let (interner, _path_receiver) = PathInterner::new();
+        let ctx = TestContext {
+            fs: fs.clone(),
+            workspace: workspace.as_ref(),
+            project_key,
+            execution: TestExecution { write: true },
+            interner,
+            evaluated_paths: HashSet::default(),
+            file_features: HashMap::default(),
+        };
+
+        let mut workspace_file = WorkspaceFile::new(&ctx, path).unwrap();
+        // Another path to the same file, such as a symlink, was written first.
+        fs.insert(file_path.clone(), OUTPUT);
+
+        workspace_file.write_to_disk(OUTPUT.into()).unwrap();
+        drop(workspace_file);
+
+        let mut disk_content = String::new();
+        fs.open(&file_path)
+            .unwrap()
+            .read_to_string(&mut disk_content)
+            .unwrap();
+        assert_eq!(disk_content, OUTPUT);
+    }
+
+    #[test]
+    fn workspace_file_compares_against_the_processed_content() {
+        const SOURCE: &str = "const value = 1;";
+        const EDITED: &str = "const value = 3;";
+
+        let file_path = Utf8PathBuf::from("/project/file.js");
+        let fs = Arc::new(MemoryFileSystem::default());
+        fs.insert(file_path.clone(), SOURCE);
+
+        let workspace = server(fs.clone(), None);
+        let OpenProjectResult { project_key } = workspace
+            .open_project(OpenProjectParams {
+                path: BiomePath::new("/project"),
+                open_uninitialized: true,
+            })
+            .unwrap();
+        let path = BiomePath::new(&file_path);
+        workspace
+            .open_file(OpenFileParams {
+                project_key,
+                path: path.clone(),
+                content: FileContent::from_client(SOURCE),
+                document_file_source: None,
+                persist_node_cache: false,
+                inline_config: None,
+                editor_features: None,
+            })
+            .unwrap();
+
+        let (interner, _path_receiver) = PathInterner::new();
+        let ctx = TestContext {
+            fs: fs.clone(),
+            workspace: workspace.as_ref(),
+            project_key,
+            execution: TestExecution { write: true },
+            interner,
+            evaluated_paths: HashSet::default(),
+            file_features: HashMap::default(),
+        };
+
+        let mut workspace_file = WorkspaceFile::new(&ctx, path.clone()).unwrap();
+        // The file is edited and the workspace picks the edit up, as a watcher would.
+        fs.insert(file_path.clone(), EDITED);
+        workspace
+            .change_file(ChangeFileParams {
+                project_key,
+                path,
+                content: EDITED.into(),
+                version: 1,
+                inline_config: None,
+                editor_features: None,
+            })
+            .unwrap();
 
         assert!(
             workspace_file

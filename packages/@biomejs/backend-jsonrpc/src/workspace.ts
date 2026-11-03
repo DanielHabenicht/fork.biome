@@ -15530,6 +15530,7 @@ export type Category =
 	| "syntax/correctness/noInitializerWithDefinite"
 	| "syntax/correctness/noDuplicatePrivateClassMembers"
 	| "transformations/stripTypes"
+	| "files/changedOnDisk"
 	| "files/missingHandler"
 	| "format"
 	| "check"

@@ -63,6 +63,14 @@ pub(crate) struct PanicDiagnostic {
 
 #[derive(Debug, Diagnostic)]
 #[diagnostic(
+    category = "files/changedOnDisk",
+    message = "The file changed on disk while Biome was processing it, so Biome didn't write its changes. Run Biome again.",
+    severity = Error
+)]
+pub(crate) struct ChangedOnDiskDiagnostic;
+
+#[derive(Debug, Diagnostic)]
+#[diagnostic(
     category = "files/missingHandler",
     message = "Biome doesn't know how to process this file",
 	severity = Warning,
